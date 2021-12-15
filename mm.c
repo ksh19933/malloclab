@@ -481,8 +481,7 @@ team_t team = {
 
 // Read and write a word at address p 
 #define GET(p)            (*(unsigned int *)(p))
-#define PUT(p, val)       (*(unsigned int *)(p) = (val) | GET_TAG(p))
-#define PUT_NOTAG(p, val) (*(unsigned int *)(p) = (val))
+#define PUT(p, val)       (*(unsigned int *)(p) = (val))
 
 // Store predecessor or successor pointer for free blocks 
 #define SET_PTR(p, ptr) (*(unsigned int *)(p) = (unsigned int)(ptr))
@@ -490,9 +489,6 @@ team_t team = {
 // Read the size and allocation bit from address p 
 #define GET_SIZE(p)  (GET(p) & ~0x7)
 #define GET_ALLOC(p) (GET(p) & 0x1)
-#define GET_TAG(p)   (GET(p) & 0x2)
-#define SET_RATAG(p)   (GET(p) |= 0x2)
-#define REMOVE_RATAG(p) (GET(p) &= ~0x2)
 
 // Address of block's header and footer 
 #define HDRP(ptr) ((char *)(ptr) - WSIZE)
@@ -524,10 +520,11 @@ static void *place(void *ptr, size_t asize);
 static void insert_node(void *ptr, size_t size);
 static void delete_node(void *ptr);
 
+/*heap memory 생성*/
 int mm_init(void){
     int list;
     char *heap_start;
-
+    //segregated_free_lists를 NULL로 초기화
     for(list = 0; list<LISTLIMIT; list++){
         segregated_free_lists[list] = NULL;
     }
@@ -535,22 +532,22 @@ int mm_init(void){
         return -1;
     }
 
-    PUT_NOTAG(heap_start, 0);
-    PUT_NOTAG(heap_start+ (1*WSIZE), PACK(DSIZE, 1));
-    PUT_NOTAG(heap_start+ (2*WSIZE), PACK(DSIZE, 1));
-    PUT_NOTAG(heap_start+ (3*WSIZE), 0);
-
+    PUT(heap_start, 0); /* Alignment padding*/
+    PUT(heap_start+ (1*WSIZE), PACK(DSIZE, 1)); /*prologue header*/
+    PUT(heap_start+ (2*WSIZE), PACK(DSIZE, 1)); /*prologue footer*/
+    PUT(heap_start+ (3*WSIZE), 0); /*Epilogue header*/
+    /* 1<<6만큼 extend */
     if(extend_heap(INITCHUNKSIZE) == NULL)
         return -1;
     return 0;
 }
 
-
+/*size만큼 heap memory를 할당*/
 void *mm_malloc(size_t size){
     size_t asize;
     size_t extendsize;
     void *ptr = NULL;
-
+    /* double word size에 맞게 size를 조정 */
     if(size == 0)
         return NULL;
     
@@ -565,7 +562,9 @@ void *mm_malloc(size_t size){
     while(list < LISTLIMIT){
         if ((list == LISTLIMIT - 1) || ((searchsize <= 1) && (segregated_free_lists[list] != NULL))){
             ptr = segregated_free_lists[list];
-            while((ptr != NULL) && ((asize > GET_SIZE(HDRP(ptr))) || (GET_TAG(HDRP(ptr))))){
+            /* 찾은 free_list 중에서 aszie보다 크기가 큰 것 중 가장 작은 것을 찾는다. */
+            /* 이때 free list는 오름차순으로 정렬되어 있다.*/
+            while((ptr != NULL) && ((asize > GET_SIZE(HDRP(ptr))))){
                 ptr = PRED(ptr);
             }
             if(ptr != NULL)
@@ -574,7 +573,7 @@ void *mm_malloc(size_t size){
         searchsize = searchsize >> 1;
         list++;
     }
-
+    /*만약 asize보다 큰 free가 존재하지 않는다면 새롭게 extend*/
     if(ptr == NULL){
         extendsize = MAX(asize, CHUNKSIZE);
 
@@ -585,9 +584,9 @@ void *mm_malloc(size_t size){
     return ptr;
 }
 
+/*ptr에 할당된 data를 free*/
 void mm_free(void *ptr){
     size_t size = GET_SIZE(HDRP(ptr));
-    REMOVE_RATAG(HDRP(NEXT_BLKP(ptr)));
     PUT(HDRP(ptr), PACK(size, 0));
     PUT(FTRP(ptr), PACK(size, 0));
     insert_node(ptr, size);
@@ -597,8 +596,11 @@ void mm_free(void *ptr){
 
 void *mm_realloc(void *ptr, size_t size){
     void *new_ptr = ptr;
+    int extendsize = 0;
+    int remainder;
     size_t new_size = size;
     size_t next_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    /*size를 double word에 맞게 조정*/
     if(size == 0)
         return NULL;
     if(new_size <= DSIZE){
@@ -606,13 +608,29 @@ void *mm_realloc(void *ptr, size_t size){
     }else{
         new_size = ALIGN(size + DSIZE);
     }
-    // new_size > befor_size
+    /*뒤에 있는 힙이 free이고 현재 size와 free size의 합이 new_size보다 클 경우*/
     if(!GET_ALLOC(HDRP(NEXT_BLKP(ptr))) && new_size <= next_size + GET_SIZE(HDRP(ptr))){
-        new_size = next_size + GET_SIZE(HDRP(ptr));
+        PUT(HDRP(ptr), PACK(next_size + GET_SIZE(HDRP(ptr)), 0));
+        PUT(FTRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
         delete_node(NEXT_BLKP(ptr));
-        PUT_NOTAG(HDRP(ptr), PACK(new_size, 1));
-        PUT_NOTAG(FTRP(ptr), PACK(new_size, 1));
-    } else{
+        place(ptr, new_size);
+    /*데이터의 위치가 heap의 최상단일 경우*/
+    }else if(!GET_SIZE(HDRP(NEXT_BLKP(ptr)))){
+        remainder = GET_SIZE(HDRP(ptr))- new_size;
+        if(remainder < 0){
+            extendsize = MAX(-remainder, 1<<5);
+            if (extend_heap(extendsize) == NULL){
+                return NULL;
+            }
+        }
+        remainder += extendsize;
+        delete_node(NEXT_BLKP(ptr));
+        // Do not split block
+        PUT(HDRP(ptr), PACK(new_size + remainder, 1)); 
+        PUT(FTRP(ptr), PACK(new_size + remainder, 1));
+         
+    } 
+    else{
         new_ptr = mm_malloc(new_size - DSIZE);
         memcpy(new_ptr, ptr, MIN(size, new_size));
         mm_free(ptr);
@@ -630,18 +648,19 @@ static void* extend_heap(size_t size){
     if((ptr = mem_sbrk(asize)) == (void *)-1)
         return NULL;
     //header와 footer 생성
-    PUT_NOTAG(HDRP(ptr), PACK(asize, 0));
-    PUT_NOTAG(FTRP(ptr), PACK(asize, 0));
-    PUT_NOTAG(HDRP(NEXT_BLKP(ptr)), PACK(0, 1));
+    PUT(HDRP(ptr), PACK(asize, 0));
+    PUT(FTRP(ptr), PACK(asize, 0));
+    PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1));
     insert_node(ptr, asize);
 
     return coalesce(ptr);
 }
-
+/*새롭게 형성된 free 노드를 free_list에 넣는 과정*/
+/*각 free_list는 오름차순으로 정렬*/
 static void insert_node(void *ptr, size_t size){
     int list = 0;
     void *search_ptr;
-    void *insert_ptr = NULL;
+    void *before_ptr = NULL;
     //사이즈에 맞는 list idx 선택
     while((list < LISTLIMIT-1) && (size > 1)){
         size >>= 1;
@@ -650,16 +669,16 @@ static void insert_node(void *ptr, size_t size){
     // 오름차수로 정렬된 ptr을 움직이며 search
     search_ptr = segregated_free_lists[list];
     while((search_ptr != NULL) && (size > GET_SIZE(HDRP(search_ptr)))){
-        insert_ptr = search_ptr;
+        before_ptr = search_ptr;
         search_ptr= PRED(search_ptr);
     }
     // Set predecessor and successor
     if (search_ptr != NULL){
-        if (insert_ptr != NULL){
+        if (before_ptr != NULL){
             SET_PTR(PRED_PTR(ptr), search_ptr);
             SET_PTR(SUCC_PTR(search_ptr), ptr);
-            SET_PTR(SUCC_PTR(ptr), insert_ptr);
-            SET_PTR(PRED_PTR(insert_ptr), ptr);
+            SET_PTR(SUCC_PTR(ptr), before_ptr);
+            SET_PTR(PRED_PTR(before_ptr), ptr);
         } else{
             SET_PTR(PRED_PTR(ptr), search_ptr);
             SET_PTR(SUCC_PTR(search_ptr), ptr);
@@ -667,10 +686,10 @@ static void insert_node(void *ptr, size_t size){
             segregated_free_lists[list] = ptr;
         }
     }else{
-        if (insert_ptr != NULL){
+        if (before_ptr != NULL){
             SET_PTR(PRED_PTR(ptr), NULL);
-            SET_PTR(SUCC_PTR(ptr), insert_ptr);
-            SET_PTR(PRED_PTR(insert_ptr), ptr);
+            SET_PTR(SUCC_PTR(ptr), before_ptr);
+            SET_PTR(PRED_PTR(before_ptr), ptr);
         } else{
             SET_PTR(PRED_PTR(ptr), NULL); // SET_PTR(p, ptr) (*(unsigned int *)(p) = (unsigned int)(ptr))
             SET_PTR(SUCC_PTR(ptr), NULL);
@@ -709,8 +728,6 @@ static void *coalesce(void *ptr){
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
     size_t size = GET_SIZE(HDRP(ptr));
     // Do not coalesce with previous block if the previous block is tagged with Reallocation tag
-    if(GET_TAG(HDRP(PREV_BLKP(ptr))))
-        prev_alloc = 1;
     if(prev_alloc && next_alloc){
         return ptr;
     }
@@ -755,16 +772,16 @@ static void *place(void *ptr, size_t asize){
     else if(asize >= 96){
         PUT(HDRP(ptr), PACK(remainder, 0));
         PUT(FTRP(ptr), PACK(remainder, 0));
-        PUT_NOTAG(HDRP(NEXT_BLKP(ptr)), PACK(asize, 1));
-        PUT_NOTAG(FTRP(NEXT_BLKP(ptr)), PACK(asize, 1));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(asize, 1));
+        PUT(FTRP(NEXT_BLKP(ptr)), PACK(asize, 1));
         insert_node(ptr, remainder);
         return NEXT_BLKP(ptr);
     }
     else{
         PUT(HDRP(ptr), PACK(asize, 1));
         PUT(FTRP(ptr), PACK(asize, 1));
-        PUT_NOTAG(HDRP(NEXT_BLKP(ptr)), PACK(remainder, 0));
-        PUT_NOTAG(FTRP(NEXT_BLKP(ptr)), PACK(remainder, 0));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(remainder, 0));
+        PUT(FTRP(NEXT_BLKP(ptr)), PACK(remainder, 0));
         insert_node(NEXT_BLKP(ptr), remainder);
     }
     return ptr;
